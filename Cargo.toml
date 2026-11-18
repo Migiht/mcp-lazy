@@ -1,0 +1,20 @@
+[package]
+name = "mcp-lazy"
+version = "0.1.0"
+edition = "2024"
+description = "Lazy, gated stdio proxy for MCP servers: answers the handshake from a cache and starts the real server on first use"
+license = "MIT"
+repository = "https://github.com/Migiht/mcp-lazy"
+readme = "README.md"
+keywords = ["mcp", "model-context-protocol", "proxy", "claude"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+serde_json = "1.0.154"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

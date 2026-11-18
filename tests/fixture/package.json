@@ -1,0 +1,10 @@
+{
+  "name": "mcp-lazy-test-fixture",
+  "private": true,
+  "type": "module",
+  "description": "A real MCP server (official TypeScript SDK) that the mcp-lazy tests run behind the proxy.",
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.4.0",
+    "zod": "^4.2.0"
+  }
+}
