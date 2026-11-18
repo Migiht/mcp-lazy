@@ -19,7 +19,9 @@ hundred tools puts a hundred tool names (plus its instructions) into the model's
   `disable_tools` hides it again. Toggling never starts the server.
 
 Both MCP wire revisions are supported: the stateful one (`initialize`) and the stateless
-2026-07-28 one (`server/discover` + `subscriptions/listen`) that current Claude Code speaks.
+2026-07-28 one (`server/discover` + `subscriptions/listen`) that current Claude Code speaks. A server
+that predates the stateless revision refuses `server/discover` and the client falls back to
+`initialize`; both answers are cached, so such servers stay lazy too.
 
 ## Install
 
@@ -42,6 +44,8 @@ claude mcp add-json figwright -s user '{
 - `--name` — cache key and the label used in the gate tools' descriptions (default: derived from the
   command).
 - `--gate` — hide the tools until `enable_tools` is called.
+- `--per-cwd` — keep a separate cache per working directory, for servers whose instructions or
+  tools depend on the project they run in (e.g. a code indexer that reports the project's state).
 
 Point it at the server's entry file rather than `npx pkg@latest`: the cache is invalidated by a
 fingerprint (size + mtime) of the files named on the command line, so a pinned local build is what
@@ -75,7 +79,9 @@ MCP_LAZY_CLAUDE_E2E=1 cargo test --release --test claude_e2e -- --nocapture   # 
 `tests/fixture` is a real MCP server built on `@modelcontextprotocol/server` (installed with
 `npm ci` on first run; needs Node). `tests/proxy.rs` drives the proxy over both protocol revisions:
 cache hits and probes, a single live start per session, working-directory inheritance,
-`initialize` replay, listen-subscription handling, the gate, cache invalidation and failure paths.
+`initialize` replay, server → client requests (`roots/list`), listen-subscription handling, servers
+that only speak the stateful revision, the gate, per-directory caches, cache invalidation and
+failure paths.
 `tests/claude_e2e.rs` runs `claude -p` through `mcp-lazy --gate` and checks the stream-json
 transcript: only `enable_tools` is visible at start, the model enables the gate, calls a real tool
 and gets the server's answer — and the server starts only when it's needed. It's opt-in because it

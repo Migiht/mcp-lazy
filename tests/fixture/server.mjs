@@ -5,9 +5,11 @@
 // Test hooks (environment):
 //   FIXTURE_SPAWN_LOG  append "<pid> <cwd>" to this file on every start — lets tests count spawns
 //   FIXTURE_CRASH=1    exit with code 3 before speaking — simulates a server that cannot start
+//   FIXTURE_LEGACY=1   speak only the stateful revision (a hand-wired StdioServerTransport answers
+//                      `server/discover` with "method not found", like servers predating 2026-07-28)
 import { appendFileSync } from 'node:fs';
 import { McpServer } from '@modelcontextprotocol/server';
-import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import { serveStdio, StdioServerTransport } from '@modelcontextprotocol/server/stdio';
 import { z } from 'zod';
 
 if (process.env.FIXTURE_CRASH === '1') process.exit(3);
@@ -45,6 +47,13 @@ const createServer = () => {
     async (_args, ctx) =>
       text(String(mcp.server.getClientVersion()?.name ?? ctx?.mcpReq?._meta?.['io.modelcontextprotocol/clientInfo']?.name ?? 'unknown')),
   );
+  // A server → client request: the server asks the client for its roots. Only possible on the
+  // stateful revision, and through the proxy only if it routes requests in both directions.
+  mcp.registerTool(
+    'roots',
+    { description: 'List the roots the client reports.', inputSchema: z.object({}) },
+    async () => text(JSON.stringify((await mcp.server.listRoots()).roots.map(r => r.uri))),
+  );
   mcp.registerPrompt(
     'greet',
     { description: 'Greet someone.', argsSchema: z.object({ name: z.string() }) },
@@ -53,4 +62,8 @@ const createServer = () => {
   return mcp;
 };
 
-serveStdio(createServer);
+if (process.env.FIXTURE_LEGACY === '1') {
+  await createServer().connect(new StdioServerTransport());
+} else {
+  serveStdio(createServer);
+}

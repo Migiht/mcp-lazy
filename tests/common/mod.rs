@@ -98,13 +98,16 @@ impl Sandbox {
     }
 
     pub fn proxy_with(&self, gate: bool, env: &[(&str, &str)]) -> Proxy {
+        let flags: &[&str] = if gate { &["--gate"] } else { &[] };
+        self.proxy_custom(flags, env, &self.work_dir())
+    }
+
+    /// Full control: extra proxy flags, extra environment and the working directory.
+    pub fn proxy_custom(&self, flags: &[&str], env: &[(&str, &str)], cwd: &Path) -> Proxy {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_mcp-lazy"));
-        cmd.args(["--name", "fixture"]);
-        if gate {
-            cmd.arg("--gate");
-        }
+        cmd.args(["--name", "fixture"]).args(flags);
         cmd.arg("--").arg("node").arg(self.entry());
-        cmd.current_dir(self.work_dir())
+        cmd.current_dir(cwd)
             .env("XDG_CACHE_HOME", self.cache_home())
             .env("FIXTURE_SPAWN_LOG", self.spawn_log())
             .stdin(Stdio::piped())
@@ -189,6 +192,11 @@ impl Proxy {
                 panic!("unexpected message while waiting for {id}: {msg}");
             }
         }
+    }
+
+    /// The next message of any kind (response, notification or server → client request).
+    pub fn next_message(&mut self) -> Value {
+        self.rx.recv_timeout(TIMEOUT).expect("no message from the proxy")
     }
 
     /// Collect whatever arrives within `wait` into `notifications`; returns how many arrived.

@@ -1,6 +1,6 @@
 //! mcp-lazy — a lazy, optionally gated stdio proxy for MCP servers.
 //!
-//! Usage: mcp-lazy [--name NAME] [--gate] -- <server command> [args...]
+//! Usage: mcp-lazy [--name NAME] [--gate] [--per-cwd] -- <server command> [args...]
 //!
 //! LAZY. Everything an MCP client asks while connecting is answered from an on-disk cache, so the
 //! real server is not running while a session merely *could* use it:
@@ -66,17 +66,20 @@ fn log(msg: &str) {
 struct Config {
     /// Cache key and the label used in the gate tools' descriptions.
     name: String,
+    /// Cache file stem: the name, plus a hash of the working directory with `--per-cwd`.
+    cache_key: String,
     gate: bool,
     cmd: Vec<String>,
 }
 
 fn parse_args() -> Config {
     let mut args = std::env::args().skip(1);
-    let (mut name, mut gate, mut cmd) = (None, false, Vec::new());
+    let (mut name, mut gate, mut per_cwd, mut cmd) = (None, false, false, Vec::new());
     while let Some(a) = args.next() {
         match a.as_str() {
             "--name" => name = args.next(),
             "--gate" => gate = true,
+            "--per-cwd" => per_cwd = true,
             "--" => {
                 cmd.extend(args.by_ref());
                 break;
@@ -89,7 +92,7 @@ fn parse_args() -> Config {
         }
     }
     if cmd.is_empty() {
-        eprintln!("usage: mcp-lazy [--name NAME] [--gate] -- <server command> [args...]");
+        eprintln!("usage: mcp-lazy [--name NAME] [--gate] [--per-cwd] -- <server command> [args...]");
         std::process::exit(2);
     }
     let name = name.unwrap_or_else(|| {
@@ -101,7 +104,18 @@ fn parse_args() -> Config {
             .unwrap_or_default();
         format!("{base}-{:016x}", h.finish())
     });
-    Config { name: sanitize(&name), gate, cmd }
+    let name = sanitize(&name);
+    // Servers whose answers depend on where they run (instructions naming the project, tools
+    // that differ per repository) need a cache per working directory.
+    let cache_key = match std::env::current_dir() {
+        Ok(cwd) if per_cwd => {
+            let mut h = DefaultHasher::new();
+            cwd.hash(&mut h);
+            format!("{name}-cwd-{:016x}", h.finish())
+        }
+        _ => name.clone(),
+    };
+    Config { name, cache_key, gate, cmd }
 }
 
 fn sanitize(s: &str) -> String {
@@ -293,8 +307,15 @@ fn probe(cmd: &[String], era: Era, handshake_line: &str) -> Option<Map<String, V
         hs["id"] = hs_id.clone();
         write_line(&mut stdin, &hs.to_string()).ok()?;
         let hs_resp = wait_for(&rx, &hs_id)?;
-        hs_resp.get("result")?;
         let mut entry = Map::new();
+        // A server that predates the stateless revision answers `server/discover` with "method not
+        // found", and the client falls back to `initialize`. That answer is as stable as any other,
+        // so it is cached too — otherwise every session of such a server would start it for real.
+        if era == Era::Stateless && hs_resp.pointer("/error/code") == Some(&json!(-32601)) {
+            entry.insert(era.handshake().into(), without_id(hs_resp));
+            return Some(entry);
+        }
+        hs_resp.get("result")?;
         entry.insert(era.handshake().into(), without_id(hs_resp));
         // Stateless requests each carry the client's _meta (version, client info); stateful ones
         // ride on the initialized connection.
@@ -494,7 +515,7 @@ impl Proxy {
         let version = version_of(msg).unwrap_or_default();
         if self.entry.is_none() || self.version != version {
             let fp = fingerprint(&self.cfg.cmd);
-            let cpath = cache_path(&self.cfg.name);
+            let cpath = cache_path(&self.cfg.cache_key);
             let mut entry = load_cache(&cpath, &fp)
                 .get(&version)
                 .and_then(Value::as_object)
@@ -525,6 +546,13 @@ impl Proxy {
             }
         }
         respond(id, &resp);
+        if resp.get("error").is_some() {
+            // The server refused this revision; the client will retry with another handshake.
+            self.era = None;
+            self.version.clear();
+            self.entry = None;
+            return;
+        }
         if era == Era::Stateful {
             self.init_line = Some(line);
         }

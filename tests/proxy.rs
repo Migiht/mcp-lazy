@@ -8,7 +8,7 @@ use common::*;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const FIXTURE_TOOLS: [&str; 4] = ["echo", "add", "whoami", "client"];
+const FIXTURE_TOOLS: [&str; 5] = ["echo", "add", "whoami", "client", "roots"];
 const SUB: &str = "io.modelcontextprotocol/subscriptionId";
 
 // ───────────────────────────── laziness ─────────────────────────────
@@ -111,6 +111,50 @@ fn stateless_listen_is_acknowledged_locally_and_not_duplicated_when_live() {
     assert!(p.take_notifications().is_empty(), "duplicate acknowledgement leaked");
 }
 
+#[test]
+fn server_to_client_requests_are_routed_both_ways() {
+    // The server asks the client for its roots mid-call; the client's answer must reach the server.
+    let sb = Sandbox::new("roots");
+    let mut p = sb.proxy(false);
+    Rev::Stateful.connect(&mut p);
+    p.send(json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "roots", "arguments": {} } }));
+    let ask = loop {
+        let m = p.next_message();
+        if m["method"] == "roots/list" {
+            break m;
+        }
+    };
+    p.send(json!({ "jsonrpc": "2.0", "id": ask["id"], "result": { "roots": [{ "uri": "file:///project" }] } }));
+    let r = p.response(&json!(1));
+    assert_eq!(text_of(&r), r#"["file:///project"]"#);
+}
+
+#[test]
+fn a_server_without_the_stateless_revision_stays_lazy() {
+    // Claude Code tries server/discover first; an older server refuses it and the client falls back
+    // to initialize. Both answers must come from the cache once warm.
+    let sb = Sandbox::new("legacy");
+    let legacy = [("FIXTURE_LEGACY", "1")];
+    for round in 0..2 {
+        let mut p = sb.proxy_with(true, &legacy);
+        let refused = p.request(json!("d"), "server/discover", Rev::Stateless.params(json!({})));
+        assert_eq!(refused["error"]["code"], -32601, "round {round}: {refused}");
+        let hs = Rev::Stateful.connect(&mut p);
+        assert!(hs["result"].get("instructions").is_none(), "round {round}: gated");
+        assert_eq!(Rev::Stateful.tool_names(&mut p, 1), ["enable_tools"], "round {round}");
+        Rev::Stateful.call(&mut p, 2, "enable_tools", json!({}));
+        assert_eq!(Rev::Stateful.tool_names(&mut p, 3).len(), FIXTURE_TOOLS.len() + 1, "round {round}");
+        assert!(p.close().success());
+    }
+    assert_eq!(sb.spawns().len(), 2, "one probe per handshake kind, then nothing");
+
+    // And it still works for real.
+    let mut p = sb.proxy_with(true, &legacy);
+    p.request(json!("d"), "server/discover", Rev::Stateless.params(json!({})));
+    Rev::Stateful.connect(&mut p);
+    assert_eq!(text_of(&Rev::Stateful.call(&mut p, 1, "echo", json!({ "text": "old" }))), "echo: old");
+}
+
 // ───────────────────────────── gate ─────────────────────────────
 
 #[test]
@@ -141,7 +185,7 @@ fn enable_and_disable_toggle_the_tool_list_without_starting_the_server() {
 
         let enabled = rev.call(&mut p, 2, "enable_tools", json!({}));
         let text = text_of(&enabled);
-        assert!(text.contains("Exposed 4 fixture tools"), "{rev:?}: {text}");
+        assert!(text.contains("Exposed 5 fixture tools"), "{rev:?}: {text}");
         assert!(text.contains("FIXTURE-INSTRUCTIONS"), "{rev:?}: instructions are handed over on enable");
         p.drain(Duration::from_millis(300));
         let notes = p.take_notifications();
@@ -227,6 +271,37 @@ fn each_protocol_version_is_cached_separately() {
         p.close();
     }
     assert_eq!(sb.spawns().len(), 2, "both revisions now cached");
+}
+
+#[test]
+fn per_cwd_keeps_a_cache_per_working_directory() {
+    let sb = Sandbox::new("per-cwd");
+    let other = sb.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let session = |flags: &[&str], cwd: &std::path::Path| {
+        let mut p = sb.proxy_custom(flags, &[], cwd);
+        Rev::Stateless.connect(&mut p);
+        let who = text_of(&Rev::Stateless.call(&mut p, 1, "whoami", json!({})));
+        p.close();
+        who
+    };
+
+    // Shared cache: the second directory reuses the first one's probe.
+    session(&[], &sb.work_dir());
+    session(&[], &other);
+    assert_eq!(sb.spawns().len(), 3, "1 probe + 2 live");
+
+    // Per-cwd cache: each directory probes once, then is served from its own cache.
+    let before = sb.spawns().len();
+    session(&["--per-cwd"], &sb.work_dir());
+    session(&["--per-cwd"], &other);
+    session(&["--per-cwd"], &other);
+    assert_eq!(sb.spawns().len() - before, 2 + 3, "2 probes (one per directory) + 3 live");
+    let probes_in_other = sb.spawns()[before..]
+        .iter()
+        .filter(|s| s.ends_with(other.canonicalize().unwrap().to_str().unwrap()))
+        .count();
+    assert_eq!(probes_in_other, 3, "1 probe + 2 live sessions ran in the other directory");
 }
 
 #[test]
