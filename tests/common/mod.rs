@@ -65,11 +65,13 @@ impl Sandbox {
 
     pub fn write_entry(&self, comment: &str) {
         let target = fixture_dir().join("server.mjs");
-        std::fs::write(
-            self.entry(),
-            format!("// {comment}\nimport {:?};\n", target.to_string_lossy()),
-        )
-        .unwrap();
+        // Node's ESM loader rejects a bare `C:\...` path on Windows; it needs a file:// URL.
+        let spec = if cfg!(windows) {
+            format!("file:///{}", target.to_string_lossy().replace('\\', "/"))
+        } else {
+            target.to_string_lossy().into_owned()
+        };
+        std::fs::write(self.entry(), format!("// {comment}\nimport {spec:?};\n")).unwrap();
     }
 
     pub fn cache_home(&self) -> PathBuf {
@@ -307,6 +309,12 @@ impl Rev {
     pub fn call(self, p: &mut Proxy, id: u64, tool: &str, args: Value) -> Value {
         p.request(json!(id), "tools/call", self.params(json!({ "name": tool, "arguments": args })))
     }
+}
+
+/// A directory as a process reports it: canonical, without the `\\?\` prefix Windows adds.
+pub fn real_path(p: &Path) -> String {
+    let s = p.canonicalize().unwrap().to_string_lossy().into_owned();
+    s.strip_prefix(r"\\?\").map(str::to_owned).unwrap_or(s)
 }
 
 pub fn text_of(resp: &Value) -> String {

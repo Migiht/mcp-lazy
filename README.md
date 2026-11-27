@@ -17,6 +17,9 @@ hundred tools puts a hundred tool names (plus its instructions) into the model's
   `enable_tools` tool and the server instructions are withheld. Calling `enable_tools` exposes the
   full list (announced with `notifications/tools/list_changed`) and returns the instructions;
   `disable_tools` hides it again. Toggling never starts the server.
+- **Idle stop** (`--idle SECONDS`). Once the server has started, it is stopped again after SECONDS
+  without traffic in either direction and with no request in flight, and restarted transparently on
+  the next call. A session that used a server once no longer pays for it for the rest of its life.
 
 Both MCP wire revisions are supported: the stateful one (`initialize`) and the stateless
 2026-07-28 one (`server/discover` + `subscriptions/listen`) that current Claude Code speaks. A server
@@ -46,6 +49,8 @@ claude mcp add-json figwright -s user '{
 - `--gate` — hide the tools until `enable_tools` is called.
 - `--per-cwd` — keep a separate cache per working directory, for servers whose instructions or
   tools depend on the project they run in (e.g. a code indexer that reports the project's state).
+- `--idle SECONDS` — stop the running server after this long without traffic (`0` or absent: keep it
+  running until the client disconnects). `--idle 1800` stops a server half an hour after its last use.
 
 Point it at the server's entry file rather than `npx pkg@latest`: the cache is invalidated by a
 fingerprint (size + mtime) of the files named on the command line, so a pinned local build is what
@@ -62,12 +67,30 @@ lets it notice upgrades — and it saves the extra `npm` process.
    acknowledgements) and buffered notifications, then forwards the request.
 3. **Afterwards** everything is forwarded verbatim, except the lists and the gate tools, which the
    proxy keeps answering so the gate keeps working.
-4. **Exit.** When the client closes stdin the proxy closes the server's stdin, waits for it and
-   exits with its exit code.
+4. **Idle stop** (`--idle`). Every message in either direction resets a timer; requests are tracked
+   until answered (client → server and server → client), and long-lived `subscriptions/listen`
+   requests are left out. When the timer runs out with nothing in flight, the server and everything
+   it started are stopped and the proxy is back to answering from the cache. The next uncached
+   request goes live again exactly as in step 2 — `initialize` and `notifications/initialized` are
+   replayed, and so are listen subscriptions (including ones opened while the server ran), with
+   their duplicate answers swallowed.
+5. **Exit.** When the client closes stdin the proxy closes the server's stdin, waits for it (at most
+   a few seconds, then stops it and its children) and exits with its exit code.
 
 Anything unexpected — an unknown protocol version, a probe that fails or times out, a paginated
 list, a resource subscription — falls back to running the server and forwarding. The worst case is
 the memory the server would cost without the proxy, never a broken call.
+
+## Windows
+
+- Bare launcher names work: `npx` resolves to `npx.cmd`, `uvx` to `uvx.exe` (through `PATH` and the
+  usual executable extensions).
+- The cache defaults to `%LOCALAPPDATA%\mcp-lazy\` when neither `XDG_CACHE_HOME` nor `HOME` is set.
+- Launchers such as `npx` and `uvx` keep the real server as a grandchild, which a plain kill would
+  leave running; probes, idle stops and shutdowns stop the whole process tree.
+- The test suite runs on Windows (fixture imported through a `file://` URL, paths compared without
+  the `\\?\` prefix). Building needs only `rustup` with the `x86_64-pc-windows-gnu` toolchain — no
+  Visual Studio.
 
 ## Tests
 
@@ -81,7 +104,10 @@ MCP_LAZY_CLAUDE_E2E=1 cargo test --release --test claude_e2e -- --nocapture   # 
 cache hits and probes, a single live start per session, working-directory inheritance,
 `initialize` replay, server → client requests (`roots/list`), listen-subscription handling, servers
 that only speak the stateful revision, the gate, per-directory caches, cache invalidation and
-failure paths.
+failure paths. `tests/idle.rs` covers `--idle`: stop after a quiet spell and restart on the next
+call (a new server process), `initialize`/`notifications/initialized` and listen replay on each
+restart without duplicate answers, no stop while a request is in flight in either direction, and no
+stop without the flag.
 `tests/claude_e2e.rs` runs `claude -p` through `mcp-lazy --gate` and checks the stream-json
 transcript: only `enable_tools` is visible at start, the model enables the gate, calls a real tool
 and gets the server's answer — and the server starts only when it's needed. It's opt-in because it
