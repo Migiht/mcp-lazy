@@ -79,7 +79,7 @@ fn live_server_inherits_the_proxys_working_directory() {
     let mut p = sb.proxy(false);
     Rev::Stateless.connect(&mut p);
     let who: Value = serde_json::from_str(&text_of(&Rev::Stateless.call(&mut p, 1, "whoami", json!({})))).unwrap();
-    assert_eq!(Some(who["cwd"].as_str().unwrap()), sb.work_dir().canonicalize().unwrap().to_str());
+    assert_eq!(who["cwd"].as_str().unwrap(), real_path(&sb.work_dir()));
 }
 
 #[test]
@@ -299,7 +299,7 @@ fn per_cwd_keeps_a_cache_per_working_directory() {
     assert_eq!(sb.spawns().len() - before, 2 + 3, "2 probes (one per directory) + 3 live");
     let probes_in_other = sb.spawns()[before..]
         .iter()
-        .filter(|s| s.ends_with(other.canonicalize().unwrap().to_str().unwrap()))
+        .filter(|s| s.ends_with(&real_path(&other)))
         .count();
     assert_eq!(probes_in_other, 3, "1 probe + 2 live sessions ran in the other directory");
 }

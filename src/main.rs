@@ -1,6 +1,11 @@
 //! mcp-lazy — a lazy, optionally gated stdio proxy for MCP servers.
 //!
-//! Usage: mcp-lazy [--name NAME] [--gate] [--per-cwd] -- <server command> [args...]
+//! Usage: mcp-lazy [--name NAME] [--gate] [--per-cwd] [--idle SECONDS] -- <server command> [args...]
+//!
+//! IDLE (`--idle SECONDS`). Once the real server runs, it is stopped again after SECONDS with no
+//! traffic in either direction and no request in flight; the next uncached message starts it again
+//! (the handshake and listen subscriptions are replayed as on the first start). Without the flag
+//! the server runs until the client disconnects.
 //!
 //! LAZY. Everything an MCP client asks while connecting is answered from an on-disk cache, so the
 //! real server is not running while a session merely *could* use it:
@@ -27,13 +32,14 @@
 //! the memory the server costs without the proxy, never a broken call.
 
 use serde_json::{Map, Value, json};
+use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -69,17 +75,30 @@ struct Config {
     /// Cache file stem: the name, plus a hash of the working directory with `--per-cwd`.
     cache_key: String,
     gate: bool,
+    /// Stop the running server after this long with no traffic (None = never).
+    idle: Option<Duration>,
     cmd: Vec<String>,
 }
 
+const USAGE: &str =
+    "usage: mcp-lazy [--name NAME] [--gate] [--per-cwd] [--idle SECONDS] -- <server command> [args...]";
+
 fn parse_args() -> Config {
     let mut args = std::env::args().skip(1);
-    let (mut name, mut gate, mut per_cwd, mut cmd) = (None, false, false, Vec::new());
+    let (mut name, mut gate, mut per_cwd, mut idle, mut cmd) = (None, false, false, None, Vec::new());
     while let Some(a) = args.next() {
         match a.as_str() {
             "--name" => name = args.next(),
             "--gate" => gate = true,
             "--per-cwd" => per_cwd = true,
+            "--idle" => match args.next().and_then(|s| s.parse::<u64>().ok()) {
+                Some(0) => idle = None,
+                Some(s) => idle = Some(Duration::from_secs(s)),
+                None => {
+                    eprintln!("--idle needs a number of seconds\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
             "--" => {
                 cmd.extend(args.by_ref());
                 break;
@@ -92,7 +111,7 @@ fn parse_args() -> Config {
         }
     }
     if cmd.is_empty() {
-        eprintln!("usage: mcp-lazy [--name NAME] [--gate] [--per-cwd] -- <server command> [args...]");
+        eprintln!("{USAGE}");
         std::process::exit(2);
     }
     let name = name.unwrap_or_else(|| {
@@ -115,7 +134,7 @@ fn parse_args() -> Config {
         }
         _ => name.clone(),
     };
-    Config { name, cache_key, gate, cmd }
+    Config { name, cache_key, gate, idle, cmd }
 }
 
 fn sanitize(s: &str) -> String {
@@ -177,12 +196,14 @@ fn fingerprint(cmd: &[String]) -> String {
 }
 
 fn which(prog: &str) -> Option<PathBuf> {
-    if prog.contains('/') {
+    if prog.contains('/') || prog.contains('\\') {
         return Some(PathBuf::from(prog));
     }
     let paths = std::env::var_os("PATH")?;
+    // Windows: `npx` is `npx.cmd`, `uvx` is `uvx.exe` — try the executable extensions too.
+    let exts: &[&str] = if cfg!(windows) { &["", ".exe", ".cmd", ".bat"] } else { &[""] };
     std::env::split_paths(&paths)
-        .map(|d| d.join(prog))
+        .flat_map(|d| exts.iter().map(move |e| d.join(format!("{prog}{e}"))))
         .find(|p| p.is_file())
 }
 
@@ -190,6 +211,7 @@ fn cache_path(name: &str) -> PathBuf {
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .or_else(|| std::env::var_os("LOCALAPPDATA").map(PathBuf::from))
         .unwrap_or_else(|| PathBuf::from("/tmp"));
     base.join("mcp-lazy").join(format!("{name}.json"))
 }
@@ -225,12 +247,34 @@ fn save_cache(path: &Path, fp: &str, version: &str, entry: &Map<String, Value>) 
 // ───────────────────────────── io helpers ─────────────────────────────
 
 fn spawn(cmd: &[String]) -> io::Result<Child> {
-    Command::new(&cmd[0])
+    // Windows: `Command` only finds `.exe` by bare name, so resolve `npx` → `npx.cmd` ourselves
+    // (std runs `.cmd`/`.bat` through cmd.exe with safe argument quoting).
+    let program = if cfg!(windows) && Path::new(&cmd[0]).extension().is_none() {
+        which(&cmd[0]).map_or_else(|| cmd[0].clone().into(), |p| p.into_os_string())
+    } else {
+        cmd[0].clone().into()
+    };
+    Command::new(program)
         .args(&cmd[1..])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
+}
+
+/// Stop a server and everything it started (`npx`/`uvx` launchers keep the real server as a
+/// grandchild, which would survive a plain kill on Windows).
+fn kill_tree(child: &mut Child) {
+    if cfg!(windows) {
+        let _ = Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Reads the child's stdout lines on a thread so reads can time out.
@@ -341,8 +385,7 @@ fn probe(cmd: &[String], era: Era, handshake_line: &str) -> Option<Map<String, V
         Some(entry)
     })();
     drop(stdin);
-    let _ = child.kill();
-    let _ = child.wait();
+    kill_tree(&mut child);
     result
 }
 
@@ -352,6 +395,38 @@ struct Live {
     child: Child,
     stdin: ChildStdin,
     out: JoinHandle<()>,
+}
+
+/// What the idle timer needs, shared with the thread that relays the server's output.
+struct Activity {
+    last: Instant,
+    /// Requests still waiting for an answer: "c:<id>" client→server, "s:<id>" server→client.
+    pending: HashSet<String>,
+}
+
+impl Activity {
+    fn new() -> Arc<Mutex<Self>> {
+        Arc::new(Mutex::new(Activity { last: Instant::now(), pending: HashSet::new() }))
+    }
+
+    /// Record a message passing through. `from_client` decides which side a request belongs to.
+    fn note(this: &Mutex<Self>, line: &str, from_client: bool) {
+        let Ok(mut a) = this.lock() else { return };
+        a.last = Instant::now();
+        let Ok(v) = serde_json::from_str::<Value>(line) else { return };
+        let Some(id) = v.get("id") else { return };
+        let (mine, theirs) = if from_client { ("c:", "s:") } else { ("s:", "c:") };
+        match v.get("method").and_then(Value::as_str) {
+            // Listen subscriptions stay open for the whole session; they must not block idling.
+            Some("subscriptions/listen") => {}
+            Some(_) => {
+                a.pending.insert(format!("{mine}{id}"));
+            }
+            None => {
+                a.pending.remove(&format!("{theirs}{id}"));
+            }
+        }
+    }
 }
 
 /// A `subscriptions/listen` the proxy acknowledged itself.
@@ -369,6 +444,9 @@ struct Proxy {
     entry: Option<Map<String, Value>>,
     /// The client's `initialize` (stateful), replayed to the server when it starts.
     init_line: Option<String>,
+    /// The client's `notifications/initialized`, replayed after `initialize` on every restart.
+    initialized_line: Option<String>,
+    activity: Arc<Mutex<Activity>>,
     listens: Vec<Listen>,
     /// Notifications received before the server ran, replayed to it on start.
     buffered: Vec<String>,
@@ -386,6 +464,8 @@ impl Proxy {
             version: String::new(),
             entry: None,
             init_line: None,
+            initialized_line: None,
+            activity: Activity::new(),
             listens: Vec::new(),
             buffered: Vec::new(),
             exposed,
@@ -414,9 +494,15 @@ impl Proxy {
             if let Some(line) = &self.init_line {
                 let _ = write_line(&mut stdin, line);
             }
+            // On a restart after idling the server has to be told the handshake is complete again.
+            if let Some(line) = &self.initialized_line {
+                let _ = write_line(&mut stdin, line);
+            }
+            let activity = Arc::clone(&self.activity);
             let out = thread::spawn(move || {
                 let stdout = io::stdout();
                 for line in rx {
+                    Activity::note(&activity, &line, false);
                     if (skip_response.is_some() || !skip_acks.is_empty())
                         && let Ok(v) = serde_json::from_str::<Value>(&line) {
                             if skip_response.as_ref().is_some_and(|id| is_response_to(&v, id)) {
@@ -451,8 +537,39 @@ impl Proxy {
     }
 
     fn forward(&mut self, line: &str) {
+        Activity::note(&self.activity, line, true);
         let live = self.ensure_live();
         let _ = write_line(&mut live.stdin, line);
+    }
+
+    /// Called about once a second: stop the server if it has been quiet long enough.
+    fn check_idle(&mut self) {
+        let Some(limit) = self.cfg.idle else { return };
+        // Without a cache the client's own handshake went straight to the server; a restart could
+        // not replay it, so a server in forward-everything mode keeps running.
+        if self.live.is_none() || self.entry.is_none() {
+            return;
+        }
+        {
+            let Ok(a) = self.activity.lock() else { return };
+            if !a.pending.is_empty() || a.last.elapsed() < limit {
+                return;
+            }
+        }
+        self.stop_live();
+        log(&format!("idle for {}s, server stopped (it restarts on the next call)", limit.as_secs()));
+    }
+
+    fn stop_live(&mut self) {
+        let Some(Live { mut child, stdin, out }) = self.live.take() else { return };
+        drop(stdin);
+        kill_tree(&mut child);
+        // The relay thread ends once the server's stdout closes; it is not joined so a stray
+        // descendant holding the pipe can never block the proxy.
+        drop(out);
+        if let Ok(mut a) = self.activity.lock() {
+            a.pending.clear();
+        }
     }
 
     fn cached(&self, method: &str) -> Option<&Value> {
@@ -672,7 +789,15 @@ impl Proxy {
                 self.handle_handshake(Era::Stateless, &id, &msg, line)
             }
             (Some("subscriptions/listen"), Some(id)) if cached && idle => self.handle_listen(&id, &msg, line),
-            // Notifications are held until the server runs (notably notifications/initialized).
+            // A listen opened while the server runs is forwarded, and remembered so a restart
+            // after idling replays it (its duplicate acknowledgement is swallowed then).
+            (Some("subscriptions/listen"), Some(id)) if cached => {
+                self.listens.push(Listen { id, honored: Map::new(), line: line.clone() });
+                self.forward(&line)
+            }
+            // Kept apart from the other notifications: it is replayed on every (re)start.
+            (Some("notifications/initialized"), None) if idle => self.initialized_line = Some(line),
+            // Notifications are held until the server runs.
             (Some(_), None) if idle => self.buffered.push(line),
             (Some("ping"), Some(id)) if idle => respond(&id, &json!({ "result": {} })),
             (Some(m), Some(id))
@@ -695,18 +820,47 @@ impl Proxy {
     fn finish(self) -> ! {
         let Some(Live { mut child, stdin, out }) = self.live else { std::process::exit(0) };
         drop(stdin); // EOF to the server: it shuts down exactly as it would without the proxy.
-        let status = child.wait();
-        let _ = out.join();
-        std::process::exit(status.ok().and_then(|s| s.code()).unwrap_or(0));
+        // ...but give up after a few seconds rather than leave a server (and its launcher's
+        // children) running after the session is gone.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Some(s),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(100)),
+                _ => {
+                    kill_tree(&mut child);
+                    break None;
+                }
+            }
+        };
+        if status.is_some() {
+            let _ = out.join();
+        }
+        std::process::exit(status.and_then(|s| s.code()).unwrap_or(0));
     }
 }
 
 fn main() {
     let mut proxy = Proxy::new(parse_args());
-    for line in io::stdin().lock().lines() {
-        let Ok(line) = line else { break };
-        if !line.trim().is_empty() {
-            proxy.handle(line);
+    // stdin is read on its own thread so the idle timer keeps ticking while the client is quiet.
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(line) => {
+                if !line.trim().is_empty() {
+                    proxy.handle(line);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => proxy.check_idle(),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     proxy.finish();
